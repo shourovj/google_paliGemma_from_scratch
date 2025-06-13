@@ -118,7 +118,7 @@ class PaliGemmaProcessor:
             for prompt in text
         ]
 
-
+        ## this returns the input_ids and attention_mask
         inputs = self.tokenizer(
             input_strings,
             return_tensor = 'pt',
@@ -129,3 +129,13 @@ class PaliGemmaProcessor:
         return_data = {'pixel_values': pixel_values, **inputs}
 
         return return_data
+    
+
+if __name__ == "__main__":
+
+    processor = PaliGemmaProcessor(tokenizer, num_image_token=256, image_size=224)
+
+    prompt = "What do u see in this picture"
+    image = torch.randn(1,3,224,224)
+
+    processed_input = processor([prompt],[image])
