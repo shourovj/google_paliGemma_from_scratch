@@ -74,6 +74,116 @@ class PaliGemmaConfig():
         self.vision_config.projection_dim = projection_dim
 
 
+class PaliGemmaMultimodalProjector(nn.Module):
+    def __init__(self, config:PaliGemmaConfig):
+        super().__init_()
+
+        self.linear = nn.Linear(config.vision_config.hidden_size, config.vision_config.projection_dim, bias=True)
+
+    def forward(self, image_features):
+        #[Batch_szie, num_patches, hidden_size] -> [Batch_size, num_patches, projection_dim]
+        hidden_states = self.linear(image_features)
+        return hidden_states
+
+
+
+class GemmaModel(nn.Module):
+    def __init__(self, config:GemmaConfig):
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.voca_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
+
+        self.layers = nn.ModuleList([
+            GemmaDecoderLayer(self.config, layer_idx) for layer_idx in range (config.num_hidden_layers)
+        ])
+
+        self.norm = nn.GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def forward(
+            self,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            input_embeds: Optional[torch.Tensor] = None,
+            kv_cache: Optional[torch.Tensor] = None,
+    ) -> torch.FloatTensor:
+        #[Batch_sisze, seq_len, hidden_size]
+        hidden_states = input_embeds
+
+        normalizer = torch.tensor(self.config.hidden_size**.5, dtype=hidden_states.dtype, device=hidden_states.device)
+
+        hidden_states = hidden_states*normalizer
+
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                kv_cache=kv_cache
+            )
+
+        hideen_states = self.norm(hidden_states)
+
+        return hidden_states
+    
+
+
+
+
+
+class GemmaForCausalLM(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.model = GemmaModel(config)
+        self.vocab_size = self.config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=True) #logits layer
+
+    def get_input_embeddings(self):
+        return self.model,embed_toekens
+        
+    def tie_weights(self):
+        self.lm_head.weigth = self.model.embed_tokens.weight
+
+    def forward(
+            self,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            input_embeds: Optional[torch.Tensor] = None,
+            kv_cache: Optional[torch.Tensor] = None,
+            ) -> Tuple:
+        
+        outputs = self.model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            input_embeds=input_embeds,
+            kv_cache=kv_cache,
+        )
+        
+        hidden_states = outputs
+        logits = self.ln_head(hidden_states)
+        logits = logits.float()
+
+        return_data = {
+            'logits': logits,
+        }
+
+        if kv_cache is not None:
+            return_data ["kv_cache"] = kv_cache
+
+        return return_data
+    
+
+
+
+
+
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(self, config:PaliGemmaConfig):
         super().__init__()
@@ -100,7 +210,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # B, num_patches, hidden_size
         scaled_image_features = image_features*((self.config.hidden_size)**-.5)
         final_embeddings = torch.zeros(batch_size, sequence_length, embed_dim, dtype=dtype, device=device)
-
+  
         #shape of these mask = [B, sequence_length]
         text_mask = (input_ids != self.config.image_token_index) & (input_ids != self.config.pad_token_id)
         image_mask = input_ids == self.config.image_token_index
@@ -115,7 +225,46 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         final_embeddings = torch.masked_scatter(image_mask, scaled_image_features, final_embeddings)
         final_embeddings = torch.where(pad_mask, torch.zeros_like(final_embeddings),final_embeddings)
 
-        return final_embeddings
+        ##Creating attention mask
+        dtype, device = input_embeds.dtype , input_embeds.device
+
+        min_dtype = torch.finfo(dtype).min
+        q_len = input_embeds.shape[1]
+
+        if kv_cache is None or kv_cache.num_items() == 0:
+
+            #for no padding
+            causal_mask = torch.full(
+                (batch_size, q_len, q_len), fill_value=0, dtype=dtype, device=device
+            )
+
+        else:
+            #generating part (during inference no masking is needed veven in the generating tokesn as we are generating one single token at a time)
+            #query must be a single token
+            assert q_len == 1
+            kv_len = kv_cache.num_items() + q_len
+            #
+            causal_mask = torch.full(
+                (batch_size, q_len, kv_len), fill_value=0, dtype=dtype, device=device
+            )
+
+        #Adding the head dimension
+        #[Batch_size, q_len, kv_len] -> [Batch_size, num_heads, q_len, kv_len]
+        causal_mask = causal_mask.unsqueeze(1)
+
+        if kv_cache is not None and kv_cache.num_items() > 0:
+            position_ids = attention_mask.cumsum(-1)[:, -1]
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+
+        else:
+
+            position_ids = (attention_mask.cumsum(-1)).masked_fill_((attention_mask==0)).to(device) 
+
+         
+
+
+        return final_embeddings, causal_mask, position_ids
 
 
     def forward(
@@ -126,8 +275,10 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             kv_cache: Optional[KVCache]=None,
             ) -> Tuple:
         
+        assert torch.all(attention_mask == 1), "the input can not be padded"
+
         #get the input embeddings [B, seq_len, hidden_size]
-        input_embeds = self.language_model.get_input_embeddings(input_ids)
+        input_embeds = self.language_model.get_input_embeddings()(input_ids)
 
         #get the input embeddings for the image patches [B, num_patches, Embd_dim]
         selected_image_features = self.vision_tower(pixel_values.to(input_embeds.dtype))
